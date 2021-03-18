@@ -19,9 +19,9 @@ use uuid::Uuid;
 
 use serenity::prelude::*;
 
-use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender};
 use std::{collections::HashSet, env};
+
+use signal_hook::iterator::Signals;
 
 extern crate derive_new;
 
@@ -192,12 +192,12 @@ async fn init() -> Result<(LibraryDB, Client), Box<dyn std::error::Error>> {
 }
 
 fn main() {
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
     let init_result = rt.block_on(init());
 
     match init_result {
-        Ok((database, mut bad_client)) => {
+        Ok((database, bad_client)) => {
             //Leaking is ok because the program will exit when the future returns and there is no
             //other way to easily get 'static
             let client = Box::leak(Box::new(bad_client));
@@ -205,8 +205,12 @@ fn main() {
             let client_join = rt.spawn(client_future);
 
             //client_join.abort();
+            println!("Waiting on SIGINT or SIGTERM");
+            let _ = Signals::new(&[signal_hook::SIGINT, signal_hook::SIGTERM]).unwrap().wait();
+            println!("Got signal. Stopping runtime");
 
-            let client_result = rt.block_on(client_join);
+            //let client_result = rt.block_on(client_join);
+            client_join.abort();
 
             println!("Interupt recieved. Shutting down");
             rt.block_on(async {
