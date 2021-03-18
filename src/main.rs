@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 use serenity::prelude::*;
 
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::{collections::HashSet, env};
 
 extern crate derive_new;
@@ -141,59 +143,80 @@ async fn try_save_db(db: &LibraryDB) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+async fn init() -> Result<(LibraryDB, Client), Box<dyn std::error::Error>> {
     let prev_db = load_library_db().await;
-    let mutex = std::sync::Mutex::new(match prev_db {
+
+    // Login with a bot token from the environment
+    let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN enviroment variable not set");
+
+    let http = Http::new_with_token(&token);
+
+    // We will fetch your bot's owners and id
+    let (owners, bot_id) = match http.get_current_application_info().await {
+        Ok(info) => {
+            let mut owners = HashSet::new();
+            if let Some(team) = info.team {
+                owners.insert(team.owner_user_id);
+            } else {
+                owners.insert(info.owner.id);
+            }
+            match http.get_current_user().await {
+                Ok(bot_id) => (owners, bot_id.id),
+                Err(why) => panic!("Could not access the bot id: {:?}", why),
+            }
+        }
+        Err(why) => panic!("Could not access application info: {:?}", why),
+    };
+
+    let framework = StandardFramework::new()
+        .configure(|c| c.on_mention(Some(bot_id)).owners(owners).prefix("!"))
+        .before(before)
+        .after(after)
+        .unrecognised_command(unknown_command)
+        .normal_message(normal_message)
+        .group(&GENERAL_GROUP);
+
+    let client = Client::builder(token)
+        .event_handler(Handler)
+        .framework(framework)
+        .await
+        .expect("Error creating client");
+
+    //Assign the database if we make it this far because this is how we tell if if
+    //initalization succeded
+    let database = match prev_db {
         Some(lib) => lib,
         None => LibraryDB::new(),
-    });
+    };
+    Ok((database, client))
+}
 
-    tokio::task::spawn(async {
-        // Login with a bot token from the environment
-        let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN enviroment variable not set");
+fn main() {
+    let mut rt = tokio::runtime::Runtime::new().unwrap();
 
-        let http = Http::new_with_token(&token);
+    let init_result = rt.block_on(init());
 
-        // We will fetch your bot's owners and id
-        let (owners, bot_id) = match http.get_current_application_info().await {
-            Ok(info) => {
-                let mut owners = HashSet::new();
-                if let Some(team) = info.team {
-                    owners.insert(team.owner_user_id);
-                } else {
-                    owners.insert(info.owner.id);
-                }
-                match http.get_current_user().await {
-                    Ok(bot_id) => (owners, bot_id.id),
-                    Err(why) => panic!("Could not access the bot id: {:?}", why),
-                }
-            }
-            Err(why) => panic!("Could not access application info: {:?}", why),
-        };
+    match init_result {
+        Ok((database, mut bad_client)) => {
+            //Leaking is ok because the program will exit when the future returns and there is no
+            //other way to easily get 'static
+            let client = Box::leak(Box::new(bad_client));
+            let client_future = client.start();
+            let client_join = rt.spawn(client_future);
 
-        let framework = StandardFramework::new()
-            .configure(|c| c.on_mention(Some(bot_id)).owners(owners).prefix("!"))
-            .before(before)
-            .after(after)
-            .unrecognised_command(unknown_command)
-            .normal_message(normal_message)
-            .group(&GENERAL_GROUP);
+            //client_join.abort();
 
-        let mut client = Client::builder(token)
-            .event_handler(Handler)
-            .framework(framework)
-            .await
-            .expect("Error creating client");
+            let client_result = rt.block_on(client_join);
 
-        if let Err(why) = client.start().await {
-            println!("An error occurred while running the client: {:?}", why);
+            println!("Interupt recieved. Shutting down");
+            rt.block_on(async {
+                try_save_db(&database).await;
+            });
         }
-    });
-
-    let _ = tokio::signal::ctrl_c().await;
-    println!("Interupt recieved. Shutting down");
-    try_save_db(&mutex.lock().unwrap()).await;
+        Err(err) => {
+            println!("Error {}", err);
+        }
+    }
 }
 
 #[command]
