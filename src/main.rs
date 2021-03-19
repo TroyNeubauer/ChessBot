@@ -1,9 +1,9 @@
 extern crate tokio;
 
-use ::serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
     framework::standard::{
+        help_commands,
         macros::{check, command, group, help, hook},
         Args, CommandGroup, CommandOptions, CommandResult, DispatchError, HelpOptions, Reason,
         StandardFramework,
@@ -12,46 +12,77 @@ use serenity::{
     model::{
         channel::{Channel, Message},
         gateway::Ready,
+        id::UserId,
+        permissions::Permissions,
     },
 };
 
-use uuid::Uuid;
-
 use serenity::prelude::*;
 
-use std::{collections::HashSet, env};
+use std::collections::HashSet;
+use std::env;
+use std::fmt::Write;
 
 use signal_hook::iterator::Signals;
+
+use lazy_static::lazy_static;
+
+mod library;
 
 extern crate derive_new;
 
 #[group]
-#[commands(check, help)]
+#[commands(check)]
 struct General;
 
+#[group]
+// Sets a single prefix for this group.
+// So one has to call commands in this group
+// via `~library XXX` instead of just `~ XXX`.
+#[prefix = "library"]
+#[description = "Commands to query, checkout, or update information about books owned by this chess club"]
+#[commands(list, checkout, return_command)]
+struct Library;
+
+// The framework provides two built-in help commands for you to use.
+// But you can also make your own customized help command that forwards
+// to the behaviour of either of them.
+#[help]
+// This replaces the information that a user can pass
+// a command-name as argument to gain specific information about it.
+#[individual_command_tip = "If you want more information about a specific command, just pass the command as argument."]
+// Some arguments require a `{}` in order to replace it with contextual information.
+// In this case our `{}` refers to a command's name.
+#[command_not_found_text = "Could not find: `{}`."]
+#[max_levenshtein_distance(2)]
+// When you use sub-groups, Serenity will use the `indention_prefix` to indicate
+// how deeply an item is indented.
+// The default value is "-", it will be changed to "+".
+#[indention_prefix = "+"]
+// On another note, you can set up the help-menu-filter-behaviour.
+// Here are all possible settings shown on all possible options.
+// First case is if a user lacks permissions for a command, we can hide the command.
+#[lacking_permissions = "Strike"]
+// If the user is nothing but lacking a certain role, we just display it hence our variant is `Nothing`.
+#[lacking_role = "Nothing"]
+// The last `enum`-variant is `Strike`, which ~~strikes~~ a command.
+#[wrong_channel = "Strike"]
+// Serenity will automatically analyse and generate a hint/tip explaining the possible
+// cases of ~~strikethrough-commands~~, but only if
+// `strikethrough_commands_tip_in_{dm, guild}` aren't specified.
+// If you pass in a value, it will be displayed instead.
+async fn my_help(
+    context: &Context,
+    msg: &Message,
+    args: Args,
+    help_options: &'static HelpOptions,
+    groups: &[&'static CommandGroup],
+    owners: HashSet<UserId>,
+) -> CommandResult {
+    let _ = help_commands::with_embeds(context, msg, args, help_options, groups, owners).await;
+    Ok(())
+}
 struct Handler;
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Book {
-    name: String,
-    author: String,
-    uuid: Uuid,
-    total_count: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct CheckoutInstance {
-    start: chrono::DateTime<chrono::offset::Local>,
-    end: chrono::DateTime<chrono::offset::Local>,
-    book: Uuid,
-    discord_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct LibraryDB {
-    books: Vec<Book>,
-    checkouts: Vec<CheckoutInstance>,
-}
 
 #[async_trait]
 impl EventHandler for Handler {
@@ -97,57 +128,11 @@ async fn normal_message(_ctx: &Context, msg: &Message) {
     println!("Message is not a command '{}'", msg.content);
 }
 
-const LIBRARY_DB_NAME: &str = "library-db.bin";
-
-async fn load_library_db() -> Option<LibraryDB> {
-    let task = tokio::fs::read(LIBRARY_DB_NAME).await;
-    match task {
-        Ok(data) => {
-            let result: Result<LibraryDB, _> = bincode::deserialize(&data);
-
-            //We want to panic on failure
-            let db = result.unwrap();
-            println!("Loaded library: {:?} from disk successfully", db);
-            Some(db)
-        }
-        Err(err) => {
-            println!("Failed to load library file: {:?}", err);
-            None
-        }
-    }
-}
-
-async fn save_library_db(db: &LibraryDB) -> Result<(), Box<dyn std::error::Error>> {
-    let data: Vec<u8> = bincode::serialize(db)?;
-    tokio::fs::write(LIBRARY_DB_NAME, data).await?;
-
-    println!("Saved library database successfully");
-    Ok(())
-}
-
-async fn try_save_db(db: &LibraryDB) {
-    match save_library_db(db).await {
-        Ok(_) => {}
-        Err(err) => {
-            println!("An error occured while trying to save thi library database!");
-            println!("{:?}", err);
-            println!("Dumping database json to stdout:");
-            let json = serde_json::to_string(&db).unwrap();
-            println!("{}", json);
-            let mut temp_file = std::env::temp_dir();
-            temp_file.push("ERAU-discord-bot-library-backup.bin");
-
-            println!("Also writing to temp file {:?}", temp_file.to_str());
-            let _ = tokio::fs::write(temp_file, json).await;
-        }
-    }
-}
-
-async fn init() -> Result<(LibraryDB, Client), Box<dyn std::error::Error>> {
-    let prev_db = load_library_db().await;
+async fn init() -> Result<(library::Database, Client), Box<dyn std::error::Error>> {
+    let prev_db = library::Database::load().await;
 
     // Login with a bot token from the environment
-    let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN enviroment variable not set");
+    let token = env::var("DISCORD_TOKEN")?;
 
     let http = Http::new_with_token(&token);
 
@@ -174,21 +159,27 @@ async fn init() -> Result<(LibraryDB, Client), Box<dyn std::error::Error>> {
         .after(after)
         .unrecognised_command(unknown_command)
         .normal_message(normal_message)
-        .group(&GENERAL_GROUP);
+        .help(&MY_HELP)
+        .group(&GENERAL_GROUP)
+        .group(&LIBRARY_GROUP);
 
     let client = Client::builder(token)
         .event_handler(Handler)
         .framework(framework)
-        .await
-        .expect("Error creating client");
+        .await?;
 
     //Assign the database if we make it this far because this is how we tell if if
     //initalization succeded
     let database = match prev_db {
         Some(lib) => lib,
-        None => LibraryDB::new(),
+        None => library::Database::new(),
     };
     Ok((database, client))
+}
+
+lazy_static! {
+    static ref STATIC_DB: std::sync::Mutex<std::cell::RefCell<Option<library::Database>>> =
+        std::sync::Mutex::new(std::cell::RefCell::new(None));
 }
 
 fn main() {
@@ -197,7 +188,11 @@ fn main() {
     let init_result = rt.block_on(init());
 
     match init_result {
-        Ok((database, bad_client)) => {
+        Ok((tmp_database, bad_client)) => {
+            {
+                let ref_cell = STATIC_DB.lock().unwrap();
+                ref_cell.replace(Some(tmp_database));
+            }
             //Leaking is ok because the program will exit when the future returns and there is no
             //other way to easily get 'static
             let client = Box::leak(Box::new(bad_client));
@@ -206,15 +201,17 @@ fn main() {
 
             //client_join.abort();
             println!("Waiting on SIGINT or SIGTERM");
-            let _ = Signals::new(&[signal_hook::SIGINT, signal_hook::SIGTERM]).unwrap().wait();
-            println!("Got signal. Stopping runtime");
+            let _ = Signals::new(&[signal_hook::SIGINT, signal_hook::SIGTERM])
+                .unwrap()
+                .wait();
 
-            //let client_result = rt.block_on(client_join);
+            println!("Got signal. Stopping runtime");
             client_join.abort();
 
-            println!("Interupt recieved. Shutting down");
             rt.block_on(async {
-                try_save_db(&database).await;
+                let mut ref_cell = STATIC_DB.lock().unwrap();
+                let database: &library::Database = ref_cell.get_mut().as_ref().unwrap();
+                library::Database::save(database).await.unwrap();
             });
         }
         Err(err) => {
@@ -224,25 +221,54 @@ fn main() {
 }
 
 #[command]
-async fn check(ctx: &Context, msg: &Message) -> CommandResult {
+#[description = "Lists the books in the library and other information such as author and availability"]
+async fn list(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+    let mut responce = String::new();
+    {
+        let mut ref_cell = STATIC_DB.lock().unwrap();
+        let database: &library::Database = ref_cell.get_mut().as_ref().unwrap();
+
+        write!(
+            responce,
+            "The library contains {} book(s)",
+            database.books.len()
+        )?;
+        for book in &database.books {
+            write!(
+                responce,
+                "  *{}* by {} - {}",
+                book.1.name,
+                book.1.author,
+                library::Database::encode_uuid(book.1.uuid)
+            )?;
+        }
+    }
+
+    msg.reply(ctx, responce).await?;
+
+    Ok(())
+}
+
+#[command]
+#[description = "Starts a checkout transaction for a book. Use this to checkout a book in the library"]
+async fn checkout(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+    msg.reply(ctx, "mate").await?;
+
+    Ok(())
+}
+
+#[command("return")]
+#[description = "Used to indicate that you have returned a book to an officer"]
+async fn return_command(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     msg.reply(ctx, "mate").await?;
 
     Ok(())
 }
 
 #[command]
-async fn help(ctx: &Context, msg: &Message) -> CommandResult {
-    msg.reply(ctx, "Help screen TODO").await?;
-    println!("Content {}", msg.content);
+#[description = "Checks the status of the bot. Replies mate if the bot is online and operational"]
+async fn check(ctx: &Context, msg: &Message) -> CommandResult {
+    msg.reply(ctx, "mate").await?;
 
     Ok(())
-}
-
-impl LibraryDB {
-    fn new() -> LibraryDB {
-        LibraryDB {
-            books: Vec::new(),
-            checkouts: Vec::new(),
-        }
-    }
 }
