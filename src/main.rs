@@ -22,13 +22,14 @@ use serenity::prelude::*;
 use std::collections::HashSet;
 use std::env;
 use std::fmt::Write;
+use std::sync::Arc;
 
 use signal_hook::iterator::Signals;
 
-use lazy_static::lazy_static;
-
 mod library;
+mod utils;
 
+#[macro_use]
 extern crate derive_new;
 
 #[group]
@@ -38,10 +39,10 @@ struct General;
 #[group]
 // Sets a single prefix for this group.
 // So one has to call commands in this group
-// via `~library XXX` instead of just `~ XXX`.
+// via `!library XXX` instead of just `! XXX`.
 #[prefix = "library"]
 #[description = "Commands to query, checkout, or update information about books owned by this chess club"]
-#[commands(list, checkout, return_command)]
+#[commands(list, checkout, return_command, add, remove, set_quantity)]
 struct Library;
 
 // The framework provides two built-in help commands for you to use.
@@ -64,7 +65,7 @@ struct Library;
 // First case is if a user lacks permissions for a command, we can hide the command.
 #[lacking_permissions = "Strike"]
 // If the user is nothing but lacking a certain role, we just display it hence our variant is `Nothing`.
-#[lacking_role = "Nothing"]
+#[lacking_role = "Strike"]
 // The last `enum`-variant is `Strike`, which ~~strikes~~ a command.
 #[wrong_channel = "Strike"]
 // Serenity will automatically analyse and generate a hint/tip explaining the possible
@@ -102,10 +103,13 @@ async fn before(_ctx: &Context, msg: &Message, command_name: &str) -> bool {
 }
 
 #[hook]
-async fn after(_ctx: &Context, _msg: &Message, command_name: &str, command_result: CommandResult) {
+async fn after(ctx: &Context, msg: &Message, command_name: &str, command_result: CommandResult) {
     match command_result {
         Ok(()) => println!("Processed command '{}'", command_name),
-        Err(why) => println!("Command '{}' returned error {:?}", command_name, why),
+        Err(why) => {
+            println!("Command '{}' returned error {:?}", command_name, why);
+            msg.reply(ctx, format!("Error: {}", why)).await;
+        }
     }
 }
 
@@ -177,9 +181,10 @@ async fn init() -> Result<(library::Database, Client), Box<dyn std::error::Error
     Ok((database, client))
 }
 
-lazy_static! {
-    static ref STATIC_DB: std::sync::Mutex<std::cell::RefCell<Option<library::Database>>> =
-        std::sync::Mutex::new(std::cell::RefCell::new(None));
+struct LibraryData;
+
+impl TypeMapKey for LibraryData {
+    type Value = Arc<RwLock<library::Database>>;
 }
 
 fn main() {
@@ -189,17 +194,22 @@ fn main() {
 
     match init_result {
         Ok((tmp_database, bad_client)) => {
-            {
-                let ref_cell = STATIC_DB.lock().unwrap();
-                ref_cell.replace(Some(tmp_database));
-            }
             //Leaking is ok because the program will exit when the future returns and there is no
             //other way to easily get 'static
             let client = Box::leak(Box::new(bad_client));
+
+            //We need to store an arc to library after adding it to context so that we can access
+            //it in commands and in this scope when we need to save during shutdown
+            let library_arc = {
+                let mut data = rt.block_on(async { client.data.write().await });
+                let library = Arc::new(RwLock::new(tmp_database));
+                data.insert::<LibraryData>(library.clone());
+                library
+            };
+
             let client_future = client.start();
             let client_join = rt.spawn(client_future);
 
-            //client_join.abort();
             println!("Waiting on SIGINT or SIGTERM");
             let _ = Signals::new(&[signal_hook::SIGINT, signal_hook::SIGTERM])
                 .unwrap()
@@ -207,11 +217,14 @@ fn main() {
 
             println!("Got signal. Stopping runtime");
             client_join.abort();
+            rt.block_on(async {
+                client_join.await;
+            });
 
             rt.block_on(async {
-                let mut ref_cell = STATIC_DB.lock().unwrap();
-                let database: &library::Database = ref_cell.get_mut().as_ref().unwrap();
-                library::Database::save(database).await.unwrap();
+                let library = library_arc.read().await;
+
+                library::Database::try_save(&library).await;
             });
         }
         Err(err) => {
@@ -222,29 +235,144 @@ fn main() {
 
 #[command]
 #[description = "Lists the books in the library and other information such as author and availability"]
-async fn list(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
-    let mut responce = String::new();
+async fn list(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
+    let mut response = String::new();
     {
-        let mut ref_cell = STATIC_DB.lock().unwrap();
-        let database: &library::Database = ref_cell.get_mut().as_ref().unwrap();
+        //Acquire the data and clone the Arc to it
+        let library_arc = { ctx.data.read().await.get::<LibraryData>().unwrap().clone() };
+
+        let library = library_arc.read().await;
 
         write!(
-            responce,
-            "The library contains {} book(s)",
-            database.books.len()
+            response,
+            "The library contains {} book(s):",
+            library.books.len()
         )?;
-        for book in &database.books {
+
+        for (uuid, book) in &library.books {
             write!(
-                responce,
-                "  *{}* by {} - {}",
-                book.1.name,
-                book.1.author,
-                library::Database::encode_uuid(book.1.uuid)
+                response,
+                "\n  *{}* by {} - {}",
+                book.name,
+                book.author,
+                library::Database::encode_uuid(book.uuid)
             )?;
+            if book.quantity > 1 {
+                write!(response, " | quantity {}", book.quantity)?;
+            }
         }
     }
 
-    msg.reply(ctx, responce).await?;
+    msg.reply(ctx, response).await?;
+
+    Ok(())
+}
+
+#[command]
+#[description = "Adds a new book to the library"]
+async fn add(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+    let book_name: String = args.single_quoted()?;
+    let book_author: String = args.single_quoted()?;
+
+    let library_arc = { ctx.data.read().await.get::<LibraryData>().unwrap().clone() };
+
+    let mut library = library_arc.write().await;
+
+    let book = library::Book::new(library.new_book_uuid(), book_name.clone(), book_author, 1);
+    let book_uuid = book.uuid;
+    let result = library.add_book(book);
+
+    if result.is_ok() {
+        msg.reply(
+            ctx,
+            format!(
+                "Added book \"{}\" successfully. ID={}",
+                book_name,
+                library::Database::encode_uuid(book_uuid)
+            ),
+        )
+        .await?;
+    }
+
+    //Having the last line be just "r" doesn't work because otherwise type inference thinks this
+    //function returns a ManipulationError and then the ? operators above fail because they return
+    //other error types.
+    let _ = result?;
+    Ok(())
+}
+
+#[command("set-quantity")]
+#[allowed_roles("Minor Pieces")]
+#[description = "Sets the quantity of a book in the library"]
+async fn set_quantity(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+    let book_input: String = args.single_quoted::<String>()?;
+    let new_quantity: u32 = args.single::<u32>()?;
+
+    let library_arc = { ctx.data.read().await.get::<LibraryData>().unwrap().clone() };
+
+    let mut library = library_arc.write().await;
+
+    let opt_book = library.get_book_from_input_mut(&book_input);
+    let result = match opt_book {
+        None => Err(library::ManipulationError::new(
+            library::ManipulationErrorType::UnknownBook(book_input),
+        )),
+
+        Some(book) => {
+            book.quantity = new_quantity;
+
+            msg.reply(
+                ctx,
+                format!(
+                    "Book \"{}\" ({}) set to have {} copies",
+                    &book.name,
+                    library::Database::encode_uuid(book.uuid),
+                    book.quantity,
+                ),
+            )
+            .await?;
+
+            Ok(())
+        }
+    };
+    let _ = result?;
+    Ok(())
+}
+
+#[command]
+#[description = "Removes a book from the library"]
+async fn remove(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+    let book_input: String = args.single_quoted::<String>()?;
+
+    let library_arc = { ctx.data.read().await.get::<LibraryData>().unwrap().clone() };
+
+    let mut library = library_arc.write().await;
+
+    let result = {
+        let opt_book = library.get_book_from_input_mut(&book_input);
+        match opt_book {
+            None => Err(library::ManipulationError::new(
+                library::ManipulationErrorType::UnknownBook(book_input),
+            )),
+
+            Some(book) => Ok((book.name.clone(), book.uuid)),
+        }
+    };
+    let (name, uuid) = result?;
+    match library.remove_book(uuid) {
+        Ok(book) => {
+            msg.reply(
+                ctx,
+                format!(
+                    "Book \"{}\" ({}) was removed",
+                    &name,
+                    library::Database::encode_uuid(uuid),
+                ),
+            )
+            .await?
+        }
+        Err(err) => Err(err)?,
+    };
 
     Ok(())
 }
@@ -252,7 +380,7 @@ async fn list(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
 #[command]
 #[description = "Starts a checkout transaction for a book. Use this to checkout a book in the library"]
 async fn checkout(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
-    msg.reply(ctx, "mate").await?;
+    msg.reply(ctx, "TODO").await?;
 
     Ok(())
 }
@@ -260,7 +388,7 @@ async fn checkout(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult
 #[command("return")]
 #[description = "Used to indicate that you have returned a book to an officer"]
 async fn return_command(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
-    msg.reply(ctx, "mate").await?;
+    msg.reply(ctx, "TODO").await?;
 
     Ok(())
 }
